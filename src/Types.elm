@@ -3,7 +3,7 @@ module Types exposing (..)
 import Browser exposing (UrlRequest)
 import Browser.Navigation exposing (Key)
 import Lamdera exposing (ClientId, SessionId)
-import Dict exposing (Dict)
+import SeqDict exposing (SeqDict)
 import Math.Vector3 as Vec3 exposing (Vec3)
 import Set exposing (Set)
 import Url exposing (Url)
@@ -23,11 +23,17 @@ type alias FrontendModel =
     , selectedPlayerId : Maybe ClientId
     , moveFactor : Float
     , turnFactor : Float
-    , otherTargets : Dict ClientId Player
+    , otherTargets : SeqDict ClientId Player
+    , cameraEye : Vec3
     , keys : Set String
     , mouseDown : Bool
     , lastMouseX : Float
     , otherPlayers : List Player
+    , enemyViewDistance : Float
+    , propViewDistance : Float
+    , showNameplates : Bool
+    , perfMode : Bool
+    , stamina : Float
     }
 
 

@@ -14,8 +14,11 @@
 - Jump: Space (soft, floaty arc)
 - Camera Toggle: C (Third-person ↔ First-person)
 - Zoom: Q/E (in/out)
+- Performance Mode: F (toggles shorter view distances)
+- Nameplates: N (toggle)
 - Target Cycle: Tab or Click (cycles)
 - Respawn: Button at bottom center
+- Clear Target: Escape
 
 ## Feel & Tuning
 
@@ -23,6 +26,11 @@
 - Jump uses gravity -9.8 m/s² with initial velocity 6.0 m/s.
 - World bounds clamp to keep players within 500×500 area.
 - Visual style inspired by Miyazaki: warm fog, soft palette, gentle tints.
+- Distance culling for clarity/perf:
+  - Enemies ~ model.enemyViewDistance (default 280)
+  - Props/trees ~ model.propViewDistance (default 140)
+  - Nameplates follow enemy distance and can be toggled.
+- Stamina for sprinting: drains while sprinting and moving; regenerates when not holding Shift.
 
 ## Networking
 

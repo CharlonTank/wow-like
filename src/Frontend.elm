@@ -10,7 +10,7 @@ import Json.Decode as Decode
 import Lamdera
 import Math.Matrix4 as Mat4 exposing (Mat4)
 import Math.Vector3 as Vec3 exposing (Vec3, vec3)
-import Dict exposing (Dict)
+import SeqDict
 import Set
 import Types exposing (..)
 import Lamdera exposing (ClientId)
@@ -52,11 +52,17 @@ init _ key =
       , selectedPlayerId = Nothing
       , moveFactor = 0
       , turnFactor = 0
-      , otherTargets = Dict.empty
+      , otherTargets = SeqDict.empty
+      , cameraEye = initialPos
       , keys = Set.empty
       , mouseDown = False
       , lastMouseX = 0
       , otherPlayers = []
+      , enemyViewDistance = 280
+      , propViewDistance = 140
+      , showNameplates = True
+      , perfMode = False
+      , stamina = 1.0
       }
     , Lamdera.sendToBackend (PlayerUpdate (vec3ToPosition3 initialPos) initialYaw)
     )
@@ -91,11 +97,18 @@ update msg model =
         UrlChanged _ ->
             ( model, Cmd.none )
 
+        -- Clear target with Escape
+        KeyDown "escape" ->
+            ( { model | keys = Set.insert "escape" model.keys, selectedPlayerId = Nothing }, Cmd.none )
+
         Tick dt ->
             let
                 dtSeconds = dt / 1000
                 baseSpeed = dt * 0.004
-                sprintMultiplier = if Set.member "shift" model.keys then 2 else 1
+                canSprint = model.stamina > 0.1
+                sprintHeld = Set.member "shift" model.keys
+                doSprint = sprintHeld && canSprint
+                sprintMultiplier = if doSprint then 2 else 1
                 targetMove = (if (Set.member "w" model.keys || Set.member "s" model.keys || Set.member "a" model.keys || Set.member "d" model.keys) then 1 else 0) |> toFloat
                 targetTurn = (if (Set.member "arrowright" model.keys || Set.member "arrowleft" model.keys) then 1 else 0) |> toFloat
                 accel = 0.004 * dt
@@ -155,6 +168,30 @@ update msg model =
                          (Vec3.getY unclampedPos)
                          (clampCoord (Vec3.getZ unclampedPos))
 
+                -- update smoothed camera eye
+                (camDistance2, camHeight2) =
+                    case model.cameraMode of
+                        ThirdPerson -> ( model.cameraDistance, model.cameraHeight )
+                        FirstPerson -> ( 0.1, 1.7 )
+
+                camOffset2 =
+                    vec3 (sin (yaw2 + pi) * camDistance2)
+                         camHeight2
+                         (cos (yaw2 + pi) * camDistance2)
+
+                eyeTarget2 = Vec3.add pos2 camOffset2
+                ease = 0.1
+                lerp a b = a + (b - a) * ease
+                newEye =
+                    vec3 (lerp (Vec3.getX model.cameraEye) (Vec3.getX eyeTarget2))
+                         (lerp (Vec3.getY model.cameraEye) (Vec3.getY eyeTarget2))
+                         (lerp (Vec3.getZ model.cameraEye) (Vec3.getZ eyeTarget2))
+
+                -- stamina update
+                staminaDrain = if doSprint && (forward /= 0 || strafe /= 0) then 0.0006 * dt else 0
+                staminaRegen = if not sprintHeld then 0.0005 * dt else 0
+                newStamina = clamp 0 1 (model.stamina - staminaDrain + staminaRegen)
+
                 newModel =
                     { model
                         | time = model.time + dt
@@ -164,6 +201,8 @@ update msg model =
                         , isGrounded = groundedNext
                         , moveFactor = newMoveFactor
                         , turnFactor = newTurnFactor
+                        , cameraEye = newEye
+                        , stamina = newStamina
                     }
                 
                 -- Send update every 100ms if moving
@@ -231,6 +270,23 @@ update msg model =
 
                 "e" ->
                     ( { baseModel | cameraDistance = clamp 2 30 (model.cameraDistance + 1) }, Cmd.none )
+
+                "f" ->
+                    -- Toggle performance mode (reduces prop/enemy distances)
+                    let
+                        newPerf = not baseModel.perfMode
+                        (enemyD, propD) = if newPerf then (200, 100) else (280, 140)
+                    in
+                    ( { baseModel
+                        | perfMode = newPerf
+                        , enemyViewDistance = enemyD
+                        , propViewDistance = propD
+                      }
+                    , Cmd.none
+                    )
+
+                "n" ->
+                    ( { baseModel | showNameplates = not baseModel.showNameplates }, Cmd.none )
 
                 _ ->
                     ( baseModel, Cmd.none )
@@ -332,7 +388,7 @@ updateFromBackend msg model =
             let
                 newList = List.map snapshotToPlayer players
                 toDict =
-                    List.foldl (\p d -> Dict.insert p.id p d) Dict.empty newList
+                    List.foldl (\p d -> SeqDict.insert p.id p d) SeqDict.empty newList
 
                 lerp a b t = a + (b - a) * t
                 lerpVec3 va vb t =
@@ -342,7 +398,7 @@ updateFromBackend msg model =
 
                 smoothed =
                     List.map (\p ->
-                        case Dict.get p.id model.otherTargets of
+                        case SeqDict.get p.id model.otherTargets of
                             Just prev ->
                                 { p
                                     | pos = lerpVec3 prev.pos p.pos 0.25
@@ -375,11 +431,43 @@ view model =
             , Attr.style "background-color" "#1a1a1a"
             ]
             [ viewWebGL model
+            , viewNameplates model
             , viewControls
             , viewDebugInfo model
+            , viewTargetHud model
             ]
         ]
     }
+viewTargetHud : Model -> Html FrontendMsg
+viewTargetHud model =
+    case model.selectedPlayerId of
+        Nothing -> Html.text ""
+        Just sid ->
+            let
+                maybeP = List.filter (\p -> p.id == sid) model.otherPlayers |> List.head
+            in
+            case maybeP of
+                Nothing -> Html.text ""
+                Just p ->
+                    Html.div
+                        [ Attr.style "position" "absolute"
+                        , Attr.style "top" "20px"
+                        , Attr.style "right" "20px"
+                        , Attr.style "padding" "10px 12px"
+                        , Attr.style "border-radius" "10px"
+                        , Attr.style "background" "rgba(255,255,255,0.9)"
+                        , Attr.style "border" "1px solid rgba(0,0,0,0.1)"
+                        , Attr.style "font-family" "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, sans-serif"
+                        , Attr.style "color" "#123"
+                        ]
+                        [ Html.div [] [ Html.text ("Target: " ++ String.left 6 p.id) ]
+                        , Html.div [] [ Html.text ("Distance: " ++
+                            let
+                                dx = Vec3.getX p.pos - Vec3.getX model.playerPos
+                                dz = Vec3.getZ p.pos - Vec3.getZ model.playerPos
+                                d = sqrt (dx*dx + dz*dz)
+                            in String.fromFloat (round (d) |> toFloat) ++ " m") ]
+                        ]
 
 
 viewWebGL : Model -> Html FrontendMsg
@@ -406,7 +494,16 @@ viewWebGL model =
                 camHeight
                 (cos (model.playerYaw + pi) * camDistance)
 
-        eye = Vec3.add model.playerPos cameraOffset
+        -- Ease camera eye for smoothness
+        eyeTarget = Vec3.add model.playerPos cameraOffset
+        eye =
+            let
+                ease = 0.1
+                lerp a b = a + (b - a) * ease
+            in
+            vec3 (lerp (Vec3.getX model.cameraEye) (Vec3.getX eyeTarget))
+                 (lerp (Vec3.getY model.cameraEye) (Vec3.getY eyeTarget))
+                 (lerp (Vec3.getZ model.cameraEye) (Vec3.getZ eyeTarget))
         target = Vec3.add model.playerPos (vec3 0 1.5 0)
         up = vec3 0 1 0
 
@@ -428,7 +525,44 @@ viewWebGL model =
                             (Mat4.makeRotate 0 (vec3 0 1 0))
                 }
 
-        player =
+        -- scatter a few trees using hash-noise, with distance culling
+        trees =
+            let
+                treeDistance = model.propViewDistance
+                treeDistance2 = treeDistance * treeDistance
+                positions =
+                    List.concatMap (\i ->
+                        List.map (\j -> ( toFloat i * 30 - 200, toFloat j * 30 - 200 )) (List.range 0 12)
+                    ) (List.range 0 12)
+
+                toEntity (px, pz) =
+                    let
+                        n = noise2 px pz
+                        dx = px - Vec3.getX eye
+                        dz = pz - Vec3.getZ eye
+                        d2 = dx * dx + dz * dz
+                    in
+                    if n < 0.25 && d2 <= treeDistance2 then
+                        let
+                            trunk =
+                                WebGL.entity vertexShader fragmentShader (boxMesh 1 4 1 (vec3 0.5 0.35 0.2))
+                                    { uniforms
+                                        | model = Mat4.makeTranslate (vec3 px 0 pz)
+                                    }
+
+                            foliage =
+                                WebGL.entity vertexShader fragmentShader (sphereMesh 10 8 2.0 (vec3 0.45 0.75 0.45))
+                                    { uniforms
+                                        | model = Mat4.makeTranslate (vec3 px 4.0 pz)
+                                    }
+                        in
+                        [ trunk, foliage ]
+                    else
+                        []
+            in
+            List.concatMap toEntity positions
+
+        playerBody =
             WebGL.entity vertexShader fragmentShader playerMesh
                 { uniforms
                     | model =
@@ -437,31 +571,64 @@ viewWebGL model =
                             (Mat4.makeRotate model.playerYaw (vec3 0 1 0))
                 }
 
+        playerHead =
+            let
+                headOffset = vec3 0 2.3 0
+            in
+            WebGL.entity vertexShader fragmentShader (sphereMesh 10 8 0.35 (vec3 0.95 0.9 0.85))
+                { uniforms
+                    | model =
+                        Mat4.mul
+                            (Mat4.makeTranslate (Vec3.add model.playerPos headOffset))
+                            (Mat4.makeRotate model.playerYaw (vec3 0 1 0))
+                }
+
         otherPlayerEntities =
+            let
+                enemyViewDistance = model.enemyViewDistance
+                enemyViewDistance2 = enemyViewDistance * enemyViewDistance
+                dist2XZ a b =
+                    let
+                        dx = Vec3.getX a - Vec3.getX b
+                        dz = Vec3.getZ a - Vec3.getZ b
+                    in
+                    dx * dx + dz * dz
+            in
             model.otherPlayers
+                |> List.filter (\p -> dist2XZ p.pos eye <= enemyViewDistance2)
                 |> List.concatMap (\p ->
                     let
-                        base = viewOtherPlayer uniforms model.selectedPlayerId p
+                        body = viewOtherPlayer uniforms model.selectedPlayerId p
                         ring = viewSelectionRing uniforms model.selectedPlayerId p
+                        head =
+                            let
+                                headOffset = vec3 0 2.3 0
+                                u = { uniforms | model =
+                                        Mat4.mul
+                                            (Mat4.makeTranslate (Vec3.add p.pos headOffset))
+                                            (Mat4.makeRotate p.yaw (vec3 0 1 0))
+                                    }
+                            in
+                            WebGL.entity vertexShader fragmentShader (sphereMesh 10 8 0.35 (vec3 0.98 0.87 0.8)) u
                     in
-                    base :: ring
+                    [ body, head ] ++ ring
                 )
 
         allEntities =
             case model.cameraMode of
                 ThirdPerson ->
-                    ground :: player :: otherPlayerEntities
+                    ground :: trees ++ (playerBody :: playerHead :: otherPlayerEntities)
 
                 FirstPerson ->
-                    ground :: otherPlayerEntities
+                    ground :: trees ++ otherPlayerEntities
     in
     WebGL.toHtml
         [ Attr.width width
         , Attr.height height
         , Attr.style "display" "block"
-        , Attr.style "border-radius" "12px"
-        , Attr.style "box-shadow" "0 16px 40px rgba(0,0,0,0.35)"
-        , Attr.style "background" "linear-gradient(180deg, #bfe6ff 0%, #d6f0d5 60%, #cfe6bc 100%)"
+        , Attr.style "border-radius" "16px"
+        , Attr.style "box-shadow" "0 24px 80px rgba(0,0,0,0.35)"
+        , Attr.style "background" "radial-gradient(70% 60% at 50% 30%, #dff3ff 0%, #cfe9d2 60%, #c6e1c3 100%)"
         , Events.on "mousedown"
             (Decode.map2 MouseDown
                 (Decode.field "clientX" Decode.float)
@@ -476,6 +643,77 @@ viewWebGL model =
         allEntities
 
 
+viewNameplates : Model -> Html FrontendMsg
+viewNameplates model =
+    let
+        width = 1280
+        height = 720
+
+        perspective = Mat4.makePerspective 60 (toFloat width / toFloat height) 0.01 500
+        camera = Mat4.makeLookAt model.cameraEye (Vec3.add model.playerPos (vec3 0 1.5 0)) (vec3 0 1 0)
+        vp = Mat4.mul perspective camera
+
+        project pos =
+            let
+                p = Mat4.transform vp pos
+                sx = ((Vec3.getX p) + 1) * 0.5 * toFloat width
+                sy = ((1 - Vec3.getY p) * 0.5) * toFloat height
+            in
+            ( sx, sy )
+
+        enemyViewDistance2 = model.enemyViewDistance * model.enemyViewDistance
+
+        dist2XZ a b =
+            let
+                dx = Vec3.getX a - Vec3.getX b
+                dz = Vec3.getZ a - Vec3.getZ b
+            in
+            dx * dx + dz * dz
+
+        renderPlate player =
+            let
+                headPos = Vec3.add player.pos (vec3 0 2.2 0)
+                (sx, sy) = project headPos
+                isSelected =
+                    case model.selectedPlayerId of
+                        Just sid -> sid == player.id
+                        Nothing -> False
+                bg = if isSelected then "rgba(47,125,93,0.95)" else "rgba(255,255,255,0.85)"
+                color = if isSelected then "white" else "#163244"
+                label = String.left 6 player.id
+            in
+            Html.div
+                [ Attr.style "position" "absolute"
+                , Attr.style "left" (String.fromFloat sx ++ "px")
+                , Attr.style "top" (String.fromFloat sy ++ "px")
+                , Attr.style "transform" "translate(-50%, -160%)"
+                , Attr.style "padding" "4px 8px"
+                , Attr.style "border-radius" "999px"
+                , Attr.style "font-size" "12px"
+                , Attr.style "font-family" "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, sans-serif"
+                , Attr.style "background" bg
+                , Attr.style "color" color
+                , Attr.style "pointer-events" "none"
+                , Attr.style "border" "1px solid rgba(0,0,0,0.1)"
+                , Attr.style "box-shadow" "0 2px 8px rgba(0,0,0,0.15)"
+                ]
+                [ Html.text label ]
+    in
+    if not model.showNameplates then
+        Html.text ""
+    else
+        Html.div
+            [ Attr.style "position" "absolute"
+            , Attr.style "width" "1280px"
+            , Attr.style "height" "720px"
+            , Attr.style "pointer-events" "none"
+            ]
+            (model.otherPlayers
+                |> List.filter (\p -> dist2XZ p.pos model.cameraEye <= enemyViewDistance2)
+                |> List.map renderPlate
+            )
+
+
 viewOtherPlayer : Uniforms -> Maybe ClientId -> Player -> WebGL.Entity
 viewOtherPlayer uniforms selectedId player =
     let
@@ -485,9 +723,9 @@ viewOtherPlayer uniforms selectedId player =
                 Nothing -> False
 
         modelMat =
-            Mat4.mul
-                (Mat4.makeTranslate player.pos)
-                (Mat4.makeRotate player.yaw (vec3 0 1 0))
+                Mat4.mul
+                    (Mat4.makeTranslate player.pos)
+                    (Mat4.makeRotate player.yaw (vec3 0 1 0))
 
         highlight = if isSelected then 0.35 else 0.0
         uniforms2 = { uniforms | model = modelMat, time = uniforms.time + highlight }
@@ -518,7 +756,7 @@ snapshotToPlayer s =
     { id = s.id
     , pos = position3ToVec3 s.pos
     , yaw = s.yaw
-    }
+        }
 
 
 viewControls : Html FrontendMsg
@@ -528,23 +766,25 @@ viewControls =
         , Attr.style "bottom" "24px"
         , Attr.style "left" "50%"
         , Attr.style "transform" "translateX(-50%)"
-        , Attr.style "color" "#172b39"
-        , Attr.style "font-family" "monospace"
-        , Attr.style "background" "rgba(255,255,255,0.85)"
-        , Attr.style "padding" "16px 20px"
-        , Attr.style "border-radius" "12px"
-        , Attr.style "backdrop-filter" "blur(4px)"
+        , Attr.style "color" "#163244"
+        , Attr.style "font-family" "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, sans-serif"
+        , Attr.style "background" "rgba(255,255,255,0.82)"
+        , Attr.style "padding" "14px 18px"
+        , Attr.style "border-radius" "14px"
+        , Attr.style "backdrop-filter" "blur(6px) saturate(120%)"
+        , Attr.style "border" "1px solid rgba(255,255,255,0.6)"
         ]
-        [ Html.div [] [ Html.text "WASD: Move (A/D strafe) | Shift: Sprint | Space: Jump | Arrows: Turn | Mouse: Look | C: Camera | Q/E: Zoom" ]
+        [ Html.div [] [ Html.text "WASD: Move (A/D strafe) • Shift: Sprint • Space: Jump • Arrows: Turn • Mouse: Look • C: Camera • Q/E: Zoom • Tab/Click: Target • F: Perf Mode • N: Nameplates • Esc: Clear Target" ]
         , Html.button
             [ Events.onClick RespawnClicked
             , Attr.style "margin-top" "10px"
-            , Attr.style "background" "#2f7d5d"
+            , Attr.style "background" "linear-gradient(180deg,#2f7d5d,#256648)"
             , Attr.style "color" "white"
             , Attr.style "border" "none"
             , Attr.style "padding" "8px 12px"
-            , Attr.style "border-radius" "8px"
+            , Attr.style "border-radius" "10px"
             , Attr.style "cursor" "pointer"
+            , Attr.style "box-shadow" "0 6px 16px rgba(0,0,0,0.2)"
             ]
             [ Html.text "Respawn" ]
         ]
@@ -556,18 +796,20 @@ viewDebugInfo model =
         [ Attr.style "position" "absolute"
         , Attr.style "top" "20px"
         , Attr.style "left" "20px"
-        , Attr.style "color" "white"
-        , Attr.style "font-family" "monospace"
-        , Attr.style "background" "rgba(0,0,0,0.7)"
-        , Attr.style "padding" "10px"
-        , Attr.style "border-radius" "5px"
-        , Attr.style "font-size" "14px"
+        , Attr.style "color" "#123"
+        , Attr.style "font-family" "Menlo, ui-monospace, SFMono-Regular, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"
+        , Attr.style "background" "rgba(255,255,255,0.85)"
+        , Attr.style "padding" "10px 12px"
+        , Attr.style "border-radius" "10px"
+        , Attr.style "font-size" "13px"
+        , Attr.style "border" "1px solid rgba(255,255,255,0.6)"
         ]
         [ Html.div [] [ Html.text ("Other players online: " ++ String.fromInt (List.length model.otherPlayers)) ]
         , Html.div [] [ Html.text ("My position: " ++ 
             "(" ++ String.fromFloat (Vec3.getX model.playerPos) ++ ", " ++ 
             String.fromFloat (Vec3.getY model.playerPos) ++ ", " ++ 
             String.fromFloat (Vec3.getZ model.playerPos) ++ ")") ]
+        , Html.div [] [ Html.text ("Stamina: " ++ String.fromFloat (round (model.stamina * 100) |> toFloat) ++ "%") ]
         ]
 
 
@@ -677,6 +919,99 @@ otherPlayerMesh =
             , face red lft lfb lbb lbt
             , face darkRed rbt rbb lbb lbt
             ]
+
+
+{-| Low-poly sphere for heads and decorative elements -}
+sphereMesh : Int -> Int -> Float -> Vec3 -> WebGL.Mesh Vertex
+sphereMesh segments rings radius color =
+    let
+        segs = max 3 segments
+        rngs = max 2 rings
+        toVertex theta phi =
+            let
+                x = radius * (sin theta) * (cos phi)
+                y = radius * (cos theta)
+                z = radius * (sin theta) * (sin phi)
+            in
+            Vertex (vec3 x y z) color
+
+        trisFor i j =
+            let
+                t1 = (toFloat i) * (pi / toFloat rngs)
+                t2 = (toFloat (i+1)) * (pi / toFloat rngs)
+                p1 = (toFloat j) * (2*pi / toFloat segs)
+                p2 = (toFloat (j+1)) * (2*pi / toFloat segs)
+
+                v00 = toVertex t1 p1
+                v01 = toVertex t1 p2
+                v10 = toVertex t2 p1
+                v11 = toVertex t2 p2
+            in
+            [ ( v00, v10, v11 )
+            , ( v11, v01, v00 )
+            ]
+
+        allTris =
+            List.concatMap (\i ->
+                List.concatMap (\j -> trisFor i j) (List.range 0 (segs-1))
+            ) (List.range 0 (rngs-1))
+    in
+    WebGL.triangles allTris
+
+
+{-| Simple box mesh centered at origin with width/height/depth and solid color -}
+boxMesh : Float -> Float -> Float -> Vec3 -> WebGL.Mesh Vertex
+boxMesh w h d color =
+    let
+        x = w / 2
+        y = h
+        z = d / 2
+
+        v px py pz = Vertex (vec3 px py pz) color
+
+        -- bottom at y=0, top at y=h
+        t = y
+        btm = 0
+
+        -- corners
+        p000 = v (-x) btm (-z)
+        p001 = v (-x) btm ( z)
+        p010 = v (-x) t (-z)
+        p011 = v (-x) t ( z)
+        p100 = v ( x) btm (-z)
+        p101 = v ( x) btm ( z)
+        p110 = v ( x) t (-z)
+        p111 = v ( x) t ( z)
+
+        tri va vb vc = ( va, vb, vc )
+    in
+    WebGL.triangles <|
+        -- front (z+)
+        [ tri p001 p101 p111, tri p111 p011 p001
+        -- back (z-)
+        , tri p100 p000 p010, tri p010 p110 p100
+        -- left (x-)
+        , tri p000 p001 p011, tri p011 p010 p000
+        -- right (x+)
+        , tri p101 p100 p110, tri p110 p111 p101
+        -- top (y+)
+        , tri p010 p011 p111, tri p111 p110 p010
+        -- bottom (y-)
+        , tri p000 p100 p101, tri p101 p001 p000
+        ]
+
+
+-- Pseudo-random hash noise in [0,1] based on x,z
+noise2 : Float -> Float -> Float
+noise2 x z =
+    let
+        n = sin (x * 12.9898 + z * 78.233) * 43758.5453
+    in
+    fract n
+
+
+fract : Float -> Float
+fract a = a - toFloat (floor a)
 
 
 selectionRingMesh : Float -> WebGL.Mesh Vertex

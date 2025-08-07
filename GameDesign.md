@@ -33,12 +33,13 @@
 ## Targeting
 
 - `selectedPlayerId : Maybe ClientId` stored locally.
-- Tab or click cycles through players by id order.
+- Tab cycles through players by id order.
+- Click selects the on-screen nearest player (screen-space projection).
 - Selected target highlighted via subtle pulse and a ground ring under them.
 
 ## Next Steps
 
-- Direct click-to-select (raycast picking) instead of cycling.
+- Improve picking with raycasting and proper depth testing.
 - Nameplates over players; simple emotes.
-- Animation/lerp for other players’ positions to smooth updates.
+- Further smooth interpolation and yaw slerp.
 - Basic obstacles/landmarks to navigate.

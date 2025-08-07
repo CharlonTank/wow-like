@@ -10,6 +10,7 @@ import Json.Decode as Decode
 import Lamdera
 import Math.Matrix4 as Mat4 exposing (Mat4)
 import Math.Vector3 as Vec3 exposing (Vec3, vec3)
+import Dict exposing (Dict)
 import Set
 import Types exposing (..)
 import Lamdera exposing (ClientId)
@@ -51,6 +52,7 @@ init _ key =
       , selectedPlayerId = Nothing
       , moveFactor = 0
       , turnFactor = 0
+      , otherTargets = Dict.empty
       , keys = Set.empty
       , mouseDown = False
       , lastMouseX = 0
@@ -295,22 +297,30 @@ update msg model =
             in
             ( { model | selectedPlayerId = nextId }, Cmd.none )
 
-        Clicked _ _ ->
+        Clicked clientX clientY ->
             let
-                -- Simplified pick: choose nearest player by world XZ distance
-                distanceOnScreen p =
+                width = 1280
+                height = 720
+                toScreen p =
                     let
-                        dx = (Vec3.getX p.pos) - (Vec3.getX model.playerPos)
-                        dz = (Vec3.getZ p.pos) - (Vec3.getZ model.playerPos)
-                        approx = sqrt (dx * dx + dz * dz)
+                        mvp = Mat4.mul (Mat4.mul (Mat4.makePerspective 60 (toFloat width / toFloat height) 0.01 500) (Mat4.makeLookAt (Vec3.add model.playerPos (vec3 (sin (model.playerYaw + pi) * model.cameraDistance) model.cameraHeight (cos (model.playerYaw + pi) * model.cameraDistance))) (Vec3.add model.playerPos (vec3 0 1.5 0)) (vec3 0 1 0))) (Mat4.mul (Mat4.makeTranslate p.pos) (Mat4.makeRotate p.yaw (vec3 0 1 0)))
+                        pos4 = Mat4.transform mvp (Vec3.vec3 0 0 0)
+                        sx = ((Vec3.getX pos4) + 1) * 0.5 * toFloat width
+                        sy = ((1 - Vec3.getY pos4) * 0.5) * toFloat height
                     in
-                    approx
+                    ( sx, sy )
+
+                dist (sx, sy) =
+                    let dx = sx - clientX
+                        dy = sy - clientY
+                    in sqrt (dx*dx + dy*dy)
 
                 nearest =
                     model.otherPlayers
-                        |> List.sortBy distanceOnScreen
+                        |> List.map (\p -> ( p.id, toScreen p ))
+                        |> List.sortBy (\(_, s) -> dist s)
                         |> List.head
-                        |> Maybe.map .id
+                        |> Maybe.map Tuple.first
             in
             ( { model | selectedPlayerId = nearest }, Cmd.none )
 
@@ -319,7 +329,34 @@ updateFromBackend : ToFrontend -> Model -> ( Model, Cmd FrontendMsg )
 updateFromBackend msg model =
     case msg of
         UpdatePlayers players ->
-            ( { model | otherPlayers = List.map snapshotToPlayer players }, Cmd.none )
+            let
+                newList = List.map snapshotToPlayer players
+                toDict =
+                    List.foldl (\p d -> Dict.insert p.id p d) Dict.empty newList
+
+                lerp a b t = a + (b - a) * t
+                lerpVec3 va vb t =
+                    vec3 (lerp (Vec3.getX va) (Vec3.getX vb) t)
+                         (lerp (Vec3.getY va) (Vec3.getY vb) t)
+                         (lerp (Vec3.getZ va) (Vec3.getZ vb) t)
+
+                smoothed =
+                    List.map (\p ->
+                        case Dict.get p.id model.otherTargets of
+                            Just prev ->
+                                { p
+                                    | pos = lerpVec3 prev.pos p.pos 0.25
+                                    , yaw = lerp prev.yaw p.yaw 0.25
+                                }
+                            Nothing -> p
+                    ) newList
+            in
+            ( { model
+                | otherPlayers = smoothed
+                , otherTargets = toDict
+              }
+            , Cmd.none
+            )
 
 
 view : Model -> Browser.Document FrontendMsg
